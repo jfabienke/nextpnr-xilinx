@@ -18,6 +18,10 @@ import java.util.*;
 public class bbaexport {
 
     static boolean xc7_flag = false;
+    static long skippedNullNodePips = 0;
+    static long skippedNullSiteWireBelPins = 0;
+    static long skippedPortBelSitePips = 0;
+    static long sitesWithoutIntTiles = 0;
 
     public static String sitePinToGlobalWire(HashSet<Node> discoveredWires, Device d, Site s, String pinname) {
         String tw = s.getTileWireNameFromPinName(pinname);
@@ -282,6 +286,10 @@ public class bbaexport {
             belsInTile.put(s.getTile(), belsInTile.getOrDefault(s.getTile(), 0) + 1);
 
             for (BELPin bp : b.getPins()) {
+                if (bp.getSiteWireName() == null) {
+                    skippedNullSiteWireBelPins++;
+                    continue;
+                }
                 NextpnrBelWire nport = new NextpnrBelWire();
                 nport.port_type = bp.isBidir() ? 2 : (bp.isOutput() ? 1 : 0);
                 nport.name = makeConstId(bp.getName());
@@ -397,13 +405,22 @@ public class bbaexport {
         private NextpnrPip addPIP(TimingModel m, PIP p, boolean reverse) {
 
 
+            Node startNode = p.getStartNode();
+            Node endNode = p.getEndNode();
+            if (startNode == null || endNode == null) {
+                skippedNullNodePips++;
+                System.err.printf("Skipping PIP with null routing node: %s.%s.%s%n",
+                        p.getTile().getName(), p.getEndWireName(), p.getStartWireName());
+                return null;
+            }
+
             // Note this is a first-pass model. It assumes that all pips are buferred and all pips have the same
             // delay regardless of location. It is to guide the nextpnr router rather than give sign-off quality
             // STA.
             TimingGroup tg = new TimingGroup(m);
-            tg.add(p.getStartNode(), p.getStartWire().getIntentCode());
+            tg.add(startNode, p.getStartWire().getIntentCode());
             tg.add(p);
-            tg.add(p.getEndNode(), p.getEndWire().getIntentCode());
+            tg.add(endNode, p.getEndWire().getIntentCode());
             var delay = m.calcDelay(tg);
             int tmg_cls = get_pip_timing_class((int)(delay));
 
@@ -481,7 +498,13 @@ public class bbaexport {
                             String sitePin = bp.getConnectedSitePinName();
                             if (sitePin != null && !sitePins.contains(bp)) {
                                 sitePins.add(bp);
-                                addSiteIOPIP(d, s, si, bp);
+                                // PORT BEL pins mirror the site boundary with the opposite
+                                // direction to the connected functional BEL pin. Exporting
+                                // both creates a reciprocal pair for one physical boundary.
+                                if (b.getBELClass() == BELClass.PORT)
+                                    skippedPortBelSitePips++;
+                                else
+                                    addSiteIOPIP(d, s, si, bp);
                             }
                             sitePips.addAll(bp.getSitePIPs());
                         }
@@ -506,6 +529,8 @@ public class bbaexport {
                 if (xc7_flag && p.getStartWireName().startsWith("CLK_BUFG_R_FBG_OUT"))
                     continue;
                 NextpnrPip np = addPIP(tmg, p, false);
+                if (np == null)
+                    continue;
                 if (p.isRouteThru() && isLogic) {
                     np.type = NextpnrPipType.LUT_ROUTETHRU;
                     // extra data: eigth[3:0]; from[3:0]; to[3:0]
@@ -863,8 +888,11 @@ public class bbaexport {
                     Tile intert = null;
                     try {
                         intert = s.getIntTile();
-                    } catch(java.lang.ArrayIndexOutOfBoundsException e) {
-
+                    } catch (ArrayIndexOutOfBoundsException | NullPointerException e) {
+                        // Boundary and processor-system sites need not connect to an
+                        // interconnect tile. Current RapidWright can throw while
+                        // following their absent boundary node.
+                        sitesWithoutIntTiles++;
                     }
                     if (intert != null) {
                         nsi.inter_x = intert.getColumn();
@@ -1007,6 +1035,8 @@ public class bbaexport {
                     Node[] nodes = {p.getStartNode(), p.getEndNode()};
                     // FIXME: best way to discover nodes in tile?
                     for (Node n : nodes) {
+                        if (n == null)
+                            continue;
                         long flatIndex = (long)(n.getTile().getRow() * d.getColumns() + n.getTile().getColumn()) << 32 | n.getWireIndex();
                         if (seenNodes.contains(flatIndex))
                             continue;
@@ -1168,5 +1198,9 @@ public class bbaexport {
         bba.println("ref timing"); // reference to bel data
         bba.println("pop");
         bbaf.close();
+        System.out.printf("Skipped %d PIPs with null routing nodes%n", skippedNullNodePips);
+        System.out.printf("Skipped %d BEL pins without site wires%n", skippedNullSiteWireBelPins);
+        System.out.printf("Skipped %d reciprocal PORT BEL site-boundary PIPs%n", skippedPortBelSitePips);
+        System.out.printf("Recorded %d sites without interconnect tiles%n", sitesWithoutIntTiles);
     }
 }
