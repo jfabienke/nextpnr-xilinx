@@ -6,7 +6,6 @@ import com.xilinx.rapidwright.device.PartNameTools;
 import com.xilinx.rapidwright.device.*;
 import com.google.gson.*;
 import com.xilinx.rapidwright.edif.*;
-import com.xilinx.rapidwright.util.RapidWright;
 import org.python.antlr.ast.Str;
 
 import java.io.FileNotFoundException;
@@ -390,6 +389,7 @@ public class json2dcp {
         }
 
         EDIFCell top = des.getNetlist().getTopCell();
+        EDIFHierCellInst topHier = des.getNetlist().getTopHierCellInst();
         EDIFNet edif_gnd = EDIFTools.getStaticNet(NetType.GND, top, des.getNetlist());
         EDIFNet edif_vcc = EDIFTools.getStaticNet(NetType.VCC, top, des.getNetlist());
 
@@ -397,16 +397,17 @@ public class json2dcp {
             //System.out.println("create net " + nn.name);
             Net n;
             if (nn.name.equals("$PACKER_VCC_NET")) {
-                n = new Net("GLOBAL_LOGIC1", edif_vcc);
+                n = new Net("GLOBAL_LOGIC1", new EDIFHierNet(topHier, edif_vcc));
                 des.addNet(n);
             } else if (nn.name.equals("$PACKER_GND_NET")) {
-                n = new Net("GLOBAL_LOGIC0", edif_gnd);
+                n = new Net("GLOBAL_LOGIC0", new EDIFHierNet(topHier, edif_gnd));
                 des.addNet(n);
             } else if (nn.name.contains("$subnet$")) {
-                n = new Net(escape_name(nn.name), (EDIFNet)null);
+                n = new Net(escape_name(nn.name));
                 des.addNet(n);
             } else {
-                n = new Net(escape_name(nn.name), new EDIFNet(escape_name(nn.name), des.getTopEDIFCell()));
+                EDIFNet edifNet = new EDIFNet(escape_name(nn.name), des.getTopEDIFCell());
+                n = new Net(escape_name(nn.name), new EDIFHierNet(topHier, edifNet));
                 des.addNet(n);
             }
             nn.rwNet = n;
@@ -428,7 +429,7 @@ public class json2dcp {
                         // Special case where no logical pin exists, mostly where we tie A6 high for a fractured LUT
                         BELPin belPin = usr.cell.rwCell.getBEL().getPin(usr.name);
                         if (belPin != null && belPin.getConnectedSitePinName() != null) {
-                            n.createPin(false, belPin.getConnectedSitePinName(), usr.cell.rwCell.getSiteInst());
+                            n.createPin(belPin.getConnectedSitePinName(), usr.cell.rwCell.getSiteInst());
                         }
                     }
 
