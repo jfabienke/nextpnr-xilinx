@@ -24,6 +24,7 @@
 #include <cmath>
 #include <cstring>
 #include <queue>
+#include <unordered_set>
 #include "log.h"
 #include "nextpnr.h"
 #include "placer1.h"
@@ -322,9 +323,9 @@ PipId Arch::getPipByName(IdString name) const
 IdString Arch::getPipName(PipId pip) const
 {
     NPNR_ASSERT(pip != PipId());
-    auto loc_info  = locInfo(pip);
-    auto pip_data  = loc_info.pip_data[pip.index];
-    auto tile_inst = chip_info->tile_insts[pip.tile];
+    const auto &loc_info  = locInfo(pip);
+    const auto &pip_data  = loc_info.pip_data[pip.index];
+    const auto &tile_inst = chip_info->tile_insts[pip.tile];
     auto site      = pip_data.site;
     auto bel       = pip_data.bel;
 
@@ -919,6 +920,20 @@ void Arch::findSourceSinkLocations()
 {
     // Use a backwards BFS to find the real location of sinks, on a best-effort basis
 #if 1
+    auto get_site_interconnect_loc = [&](WireId wire, Loc &loc) {
+        if (wire.tile == -1)
+            return false;
+        const auto &wire_info = wireInfo(wire);
+        const auto &tile = chip_info->tile_insts[wire.tile];
+        if (wire_info.site < 0 || wire_info.site >= tile.num_sites)
+            return false;
+        const auto &site = tile.site_insts[wire_info.site];
+        if (site.inter_x == -1 || site.inter_y == -1)
+            return false;
+        loc = Loc(site.inter_x, site.inter_y, 0);
+        return true;
+    };
+
     for (auto net : sorted(nets)) {
         NetInfo *ni = net.second;
         for (auto &usr : ni->users) {
@@ -928,13 +943,20 @@ void Arch::findSourceSinkLocations()
             WireId sink = getCtx()->getNetinfoSinkWire(ni, usr);
             if (sink == WireId() || sink_locs.count(sink))
                 continue;
+            Loc sink_loc;
+            if (get_site_interconnect_loc(sink, sink_loc)) {
+                sink_locs[sink] = sink_loc;
+                continue;
+            }
             std::queue<WireId> visit;
             std::unordered_map<WireId, WireId> backtrace;
+            std::unordered_set<WireId> visited;
             int iter = 0;
             // as this is a best-effort optimisation to slightly improve routing,
             // don't spend too long with a nice low iteration limit
             const int iter_max = 500;
             visit.push(sink);
+            visited.insert(sink);
             while (!visit.empty() && iter < iter_max) {
                 ++iter;
                 WireId cursor = visit.front();
@@ -962,7 +984,7 @@ void Arch::findSourceSinkLocations()
                 }
                 for (auto pip : getPipsUphill(cursor)) {
                     WireId src = getPipSrcWire(pip);
-                    if (!backtrace.count(src)) {
+                    if (visited.insert(src).second) {
                         backtrace[src] = cursor;
                         visit.push(getPipSrcWire(pip));
                     }
@@ -978,13 +1000,20 @@ void Arch::findSourceSinkLocations()
             WireId source = getCtx()->getNetinfoSourceWire(ni);
             if (source == WireId() || source_locs.count(source))
                 continue;
+            Loc source_loc;
+            if (get_site_interconnect_loc(source, source_loc)) {
+                source_locs[source] = source_loc;
+                continue;
+            }
             std::queue<WireId> visit;
             std::unordered_map<WireId, WireId> backtrace;
+            std::unordered_set<WireId> visited;
             int iter = 0;
             // as this is a best-effort optimisation to slightly improve routing,
             // don't spend too long with a nice low iteration limit
             const int iter_max = 500;
             visit.push(source);
+            visited.insert(source);
             while (!visit.empty() && iter < iter_max) {
                 ++iter;
                 WireId cursor = visit.front();
@@ -1012,7 +1041,7 @@ void Arch::findSourceSinkLocations()
                 }
                 for (auto pip : getPipsDownhill(cursor)) {
                     WireId dst = getPipDstWire(pip);
-                    if (!backtrace.count(dst)) {
+                    if (visited.insert(dst).second) {
                         backtrace[dst] = cursor;
                         visit.push(getPipDstWire(pip));
                     }
