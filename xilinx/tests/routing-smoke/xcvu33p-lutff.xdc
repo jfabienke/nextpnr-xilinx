@@ -1,0 +1,8 @@
+set_property PACKAGE_PIN BF16 [get_ports clk]
+set_property PACKAGE_PIN BF17 [get_ports i]
+set_property PACKAGE_PIN BF18 [get_ports j]
+set_property PACKAGE_PIN BF19 [get_ports o]
+set_property IOSTANDARD LVCMOS18 [get_ports clk]
+set_property IOSTANDARD LVCMOS18 [get_ports i]
+set_property IOSTANDARD LVCMOS18 [get_ports j]
+set_property IOSTANDARD LVCMOS18 [get_ports o]
