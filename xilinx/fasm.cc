@@ -497,7 +497,13 @@ struct FasmBackend
         bool is_sync    = false;
         bool is_clkinv  = false;
         bool is_srused  = false;
-        bool is_ceused  = false;
+        // CE is tracked per FF position (BEL_FF vs BEL_FF2), matching the UltraScale+ placement
+        // legality model (arch_place.cc, ce[2]): the two positions of a half may legally carry
+        // different CE nets (two CKEN lines per half in US+ hardware), while CLK/SR remain
+        // half-wide. A single half-wide flag here (the old 7-series model) aborts on any real
+        // US+ design that packs a used-CE FF and a constant-CE FF at different positions.
+        bool is_ceused[2]   = {false, false};
+        bool found_ff_pos[2] = {false, false};
 
 #define SET_CHECK(dst, src)                                                                                            \
     do {                                                                                                               \
@@ -582,7 +588,14 @@ struct FasmBackend
                 NetInfo *sr = get_net_or_empty(ff, ctx->id("SR")), *ce = get_net_or_empty(ff, ctx->id("CE"));
 
                 SET_CHECK(is_srused, sr != nullptr && sr->name != ctx->id("$PACKER_GND_NET"));
-                SET_CHECK(is_ceused, ce != nullptr && ce->name != ctx->id("$PACKER_VCC_NET"));
+                {
+                    bool ceused = ce != nullptr && ce->name != ctx->id("$PACKER_VCC_NET");
+                    if (found_ff_pos[j])
+                        NPNR_ASSERT(is_ceused[j] == ceused);
+                    else
+                        is_ceused[j] = ceused;
+                    found_ff_pos[j] = true;
+                }
 
                 // Input mux
                 write_routing_bel(ctx->getBelPinWire(ff->bel, ctx->id("D")));
@@ -595,7 +608,11 @@ struct FasmBackend
         write_bit("CLKINV",    is_clkinv);
         write_bit("NOCLKINV", !is_clkinv);
         write_bit("SRUSEDMUX", is_srused);
-        write_bit("CEUSEDMUX", is_ceused);
+        // Per-position CE features. Both names are 7-series-shaped placeholders: real US+ CLE
+        // feature names (per-CKEN) come from the segbits campaign; this split is about tracking
+        // CE truthfully per position, not about correct US+ feature naming.
+        write_bit("CEUSEDMUX", is_ceused[0]);
+        write_bit("CEUSEDMUX2", is_ceused[1]);
         pop(2);
     }
 
