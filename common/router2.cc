@@ -28,12 +28,15 @@
 
 #include "router2.h"
 #include <algorithm>
+#include <array>
 #include <boost/container/flat_map.hpp>
 #include <chrono>
 #include <deque>
 #include <fstream>
+#include <mutex>
 #include <queue>
 #include <thread>
+#include <unordered_map>
 #include "log.h"
 #include "nextpnr.h"
 #include "router1.h"
@@ -84,23 +87,114 @@ struct Router2
         boost::container::flat_map<int, std::pair<int, PipId>> bound_nets;
         // Historical congestion cost
         float hist_cong_cost = 1.0;
-        // Wire is unavailable as locked to another arc
-        bool unavailable = false;
+    };
+
+    // Per-wire A*-candidate probe fields, packed into one 12-byte record (SoA split #2). The
+    // rejection checks (unavailable / reserved_net / bounding-box x,y) run once per explored pip
+    // candidate; embedded in PerWireData they made ~30% of touched flat_wires cache lines carry
+    // <=8 used bytes (measured, LINEUTIL iter=1). Packed: 5.3 probes per cache line, one fetch
+    // per candidate instead of scattered reads across a ~56-byte record.
+    struct WireProbe
+    {
         // This wire has to be used for this net
-        int reserved_net = -1;
+        int32_t reserved_net = -1;
         // The notional location of the wire, to guarantee thread safety
         int16_t x = 0, y = 0;
-        // Visit data
-        struct
-        {
-            bool dirty = false, visited = false;
-            PipId pip;
-            WireScore score;
-        } visit;
+        // Wire is unavailable as locked to another arc
+        uint8_t unavailable = 0;
     };
+
+    // Hot A*-visit state, split out of PerWireData (structure-of-arrays). was_visited() runs once
+    // per explored pip candidate; with the visit state embedded in the ~80-byte PerWireData record
+    // each check pulled a whole cache line of cold data (bound_nets map header, congestion cost,
+    // ...) to read one bool. A dense byte array packs ~64 wires' flags per line instead. pip/score
+    // are only written for accepted wires and read on backtrack (both far rarer than the flag
+    // probe), so they live in their own parallel arrays rather than re-fattening the hot one.
+    // Same indexing as flat_wires; sized once in setup_wires(). Layout-only change: semantics and
+    // results must be identical to the AoS version (verified bit-identical routed output).
+    static constexpr uint8_t VISIT_VISITED = 0x1, VISIT_DIRTY = 0x2;
+    std::vector<uint8_t> visit_flags;
+    std::vector<PipId> visit_pip;
+    std::vector<WireScore> visit_score;
+    std::vector<WireProbe> probes;
+
+#ifdef ROUTER2_LINE_UTIL
+    // Path-B cache-line utilization shadow tracker (measurement build only, see
+    // docs/reports in vu33p-open). Records a byte-mask per touched 64B line of the tracked
+    // arrays via LU_TRACK at access sites; per router iteration (single-threaded point) the
+    // masks merge into a per-array histogram of popcount/64. Epoch-level touch density, not
+    // true eviction-time utilization -- the decision metric for AoS/SoA layout questions.
+    struct LineUtil
+    {
+        struct Range
+        {
+            uintptr_t lo = 0, hi = 0;
+            const char *name = "";
+        };
+        std::array<Range, 5> ranges;
+        using Mask = std::unordered_map<uintptr_t, uint64_t>;
+        std::mutex reg_mtx;
+        std::vector<Mask *> all_masks;
+        Mask &tls()
+        {
+            thread_local Mask *m = nullptr;
+            if (!m) {
+                m = new Mask;
+                std::lock_guard<std::mutex> lk(reg_mtx);
+                all_masks.push_back(m);
+            }
+            return *m;
+        }
+        void track(const void *p, size_t n)
+        {
+            uintptr_t a = (uintptr_t)p;
+            Mask &m = tls();
+            while (n) {
+                size_t off = a & 63, take = std::min(n, size_t(64) - off);
+                m[a >> 6] |= (take == 64 ? ~0ull : (((1ull << take) - 1) << off));
+                a += take;
+                n -= take;
+            }
+        }
+        void report(int iter)
+        {
+            Mask merged;
+            for (auto *m : all_masks) {
+                for (auto &kv : *m)
+                    merged[kv.first] |= kv.second;
+                m->clear();
+            }
+            for (auto &r : ranges) {
+                if (r.lo == r.hi)
+                    continue;
+                long lines = 0, bytes = 0;
+                long hist[5] = {0, 0, 0, 0, 0};
+                for (auto &kv : merged) {
+                    uintptr_t la = kv.first << 6;
+                    if (la < r.lo || la >= r.hi)
+                        continue;
+                    int used = __builtin_popcountll(kv.second);
+                    lines++;
+                    bytes += used;
+                    hist[used <= 8 ? 0 : used <= 16 ? 1 : used <= 32 ? 2 : used <= 48 ? 3 : 4]++;
+                }
+                if (lines)
+                    log_info("LINEUTIL iter=%d arr=%s lines=%ld mean_used=%.1f%% hist(<=8/16/32/48/64)=%ld/%ld/%ld/%ld/%ld\n",
+                             iter, r.name, lines, (100.0 * bytes) / (lines * 64.0), hist[0], hist[1], hist[2],
+                             hist[3], hist[4]);
+            }
+        }
+    } line_util;
+#define LU_TRACK(p, n) line_util.track((p), (n))
+#else
+#define LU_TRACK(p, n)                                                                                                 \
+    do {                                                                                                               \
+    } while (0)
+#endif
 
     float present_wire_cost(const PerWireData &w, int net_uid)
     {
+        LU_TRACK(&w.bound_nets, sizeof(w.bound_nets));
         int other_sources = int(w.bound_nets.size());
         if (w.bound_nets.count(net_uid))
             other_sources -= 1;
@@ -201,32 +295,97 @@ struct Router2
         }
     }
 
+#ifdef ARCH_XILINX
+    // Linear-array replacement for the former wire_to_idx hash dict -- the hottest leaf in the
+    // sampled profile (dict::do_lookup, ~34% of active router CPU; one hash probe per explored
+    // pip candidate). WireId is (tile, index), so the mapping becomes two dense array reads:
+    // tile_wire_to_flat[tile_wire_base[tile] + index]. Slots for non-canonical wires stay -1
+    // and are never queried: every caller passes canonical WireIds (arch functions canonicalize
+    // before returning them).
+    // Canonical WireIds come in two shapes in this arch: single-tile wires as (tile, index),
+    // and multi-tile nodes as (tile == -1, index == global node id). One dense array per shape.
+    std::vector<int32_t> tile_wire_base;
+    std::vector<int32_t> tile_wire_to_flat;
+    std::vector<int32_t> node_to_flat;
+    int wire_index(WireId w)
+    {
+        int idx = (w.tile == -1) ? node_to_flat[w.index]
+                                 : tile_wire_to_flat[size_t(tile_wire_base[w.tile]) + w.index];
+        return idx;
+    }
+#else
     dict<WireId, int> wire_to_idx;
+    int wire_index(WireId w) { return wire_to_idx.at(w); }
+#endif
     std::vector<PerWireData> flat_wires;
 
-    PerWireData &wire_data(WireId w) { return flat_wires[wire_to_idx.at(w)]; }
+    PerWireData &wire_data(WireId w)
+    {
+        PerWireData &wd = flat_wires[wire_index(w)];
+        LU_TRACK(&wd, sizeof(PerWireData)); // whole-record: conservative (overstates utilization)
+        return wd;
+    }
 
     void setup_wires()
     {
+#ifdef ARCH_XILINX
+        {
+            int nt = ctx->chip_info->num_tiles;
+            tile_wire_base.resize(nt + 1);
+            tile_wire_base[0] = 0;
+            for (int t = 0; t < nt; t++)
+                tile_wire_base[t + 1] =
+                        tile_wire_base[t] +
+                        ctx->chip_info->tile_types[ctx->chip_info->tile_insts[t].type].num_wires;
+            tile_wire_to_flat.assign(size_t(tile_wire_base[nt]), -1);
+            node_to_flat.assign(size_t(ctx->chip_info->num_nodes), -1);
+            log_info("    wire-index tables: %d tiles, %.1fM tile-wire slots + %.1fM node slots (%.1f MiB)\n", nt,
+                     tile_wire_to_flat.size() / 1e6, node_to_flat.size() / 1e6,
+                     ((tile_wire_to_flat.size() + node_to_flat.size()) * 4.0) / (1024 * 1024));
+        }
+#endif
         // Set up per-wire structures, so that MT parts don't have to do any memory allocation
         // This is possibly quite wasteful and not cache-optimal; further consideration necessary
         for (auto wire : ctx->getWires()) {
             PerWireData pwd;
+            WireProbe wp;
             pwd.w = wire;
             NetInfo *bound = ctx->getBoundWireNet(wire);
             if (bound != nullptr) {
                 pwd.bound_nets[bound->udata] = std::make_pair(1, bound->wires.at(wire).pip);
                 if (bound->wires.at(wire).strength > STRENGTH_STRONG)
-                    pwd.unavailable = true;
+                    wp.unavailable = 1;
             }
 
             ArcBounds wire_loc = ctx->getRouteBoundingBox(wire, wire);
-            pwd.x = (wire_loc.x0 + wire_loc.x1) / 2;
-            pwd.y = (wire_loc.y0 + wire_loc.y1) / 2;
+            wp.x = (wire_loc.x0 + wire_loc.x1) / 2;
+            wp.y = (wire_loc.y0 + wire_loc.y1) / 2;
+            probes.push_back(wp);
 
+#ifdef ARCH_XILINX
+            if (wire.tile == -1)
+                node_to_flat[wire.index] = int(flat_wires.size());
+            else
+                tile_wire_to_flat[size_t(tile_wire_base[wire.tile]) + wire.index] = int(flat_wires.size());
+#else
             wire_to_idx[wire] = int(flat_wires.size());
+#endif
             flat_wires.push_back(pwd);
         }
+        visit_flags.assign(flat_wires.size(), 0);
+        visit_pip.assign(flat_wires.size(), PipId());
+        visit_score.assign(flat_wires.size(), WireScore());
+#ifdef ROUTER2_LINE_UTIL
+        line_util.ranges[0] = {(uintptr_t)flat_wires.data(), (uintptr_t)(flat_wires.data() + flat_wires.size()),
+                               "flat_wires"};
+        line_util.ranges[1] = {(uintptr_t)visit_flags.data(), (uintptr_t)(visit_flags.data() + visit_flags.size()),
+                               "visit_flags"};
+        line_util.ranges[2] = {(uintptr_t)visit_pip.data(), (uintptr_t)(visit_pip.data() + visit_pip.size()),
+                               "visit_pip"};
+        line_util.ranges[3] = {(uintptr_t)visit_score.data(), (uintptr_t)(visit_score.data() + visit_score.size()),
+                               "visit_score"};
+        line_util.ranges[4] = {(uintptr_t)probes.data(), (uintptr_t)(probes.data() + probes.size()), "probes"};
+#endif
     }
 
     struct QueuedWire
@@ -281,9 +440,11 @@ struct Router2
         DeterministicRNG rng;
     };
 
-    bool thread_test_wire(ThreadContext &t, PerWireData &w)
+    bool thread_test_wire(ThreadContext &t, int wire_idx)
     {
-        return w.x >= t.bb.x0 && w.x <= t.bb.x1 && w.y >= t.bb.y0 && w.y <= t.bb.y1;
+        WireProbe &p = probes[wire_idx];
+        LU_TRACK(&p, sizeof(WireProbe));
+        return p.x >= t.bb.x0 && p.x <= t.bb.x1 && p.y >= t.bb.y0 && p.y <= t.bb.y1;
     }
 
     enum ArcRouteResult
@@ -411,7 +572,8 @@ struct Router2
         // and LUT
         if (iter_count > 0)
             return false; // heuristic to assume we've hit general routing
-        if (wire_data(wire).reserved_net != -1 && wire_data(wire).reserved_net != net->udata)
+        int wrsv = probes[wire_index(wire)].reserved_net;
+        if (wrsv != -1 && wrsv != net->udata)
             return true; // reserved for another net
         for (auto bp : ctx->getWireBelPins(wire))
             if ((net->driver.cell == nullptr || bp.bel == net->driver.cell->bel) &&
@@ -439,11 +601,11 @@ struct Router2
         if (ctx->debug)
             log("reserving wires for arc %d of net %s\n", int(i), ctx->nameOf(net));
         while (!done) {
-            auto &wd = wire_data(cursor);
+            auto &pr = probes[wire_index(cursor)];
             if (ctx->debug)
                 log("      %s\n", ctx->nameOfWire(cursor));
-            did_something |= (wd.reserved_net != net->udata);
-            wd.reserved_net = net->udata;
+            did_something |= (pr.reserved_net != net->udata);
+            pr.reserved_net = net->udata;
             if (cursor == src)
                 break;
             WireId next_cursor;
@@ -483,25 +645,32 @@ struct Router2
     void reset_wires(ThreadContext &t)
     {
         for (auto w : t.dirty_wires) {
-            flat_wires[w].visit.visited = false;
-            flat_wires[w].visit.dirty = false;
-            flat_wires[w].visit.pip = PipId();
-            flat_wires[w].visit.score = WireScore();
+            LU_TRACK(&visit_flags[w], 1);
+            LU_TRACK(&visit_pip[w], sizeof(PipId));
+            LU_TRACK(&visit_score[w], sizeof(WireScore));
+            visit_flags[w] = 0;
+            visit_pip[w] = PipId();
+            visit_score[w] = WireScore();
         }
         t.dirty_wires.clear();
     }
 
     void set_visited(ThreadContext &t, int wire, PipId pip, WireScore score)
     {
-        auto &v = flat_wires.at(wire).visit;
-        if (!v.dirty)
+        LU_TRACK(&visit_flags[wire], 1);
+        LU_TRACK(&visit_pip[wire], sizeof(PipId));
+        LU_TRACK(&visit_score[wire], sizeof(WireScore));
+        if (!(visit_flags[wire] & VISIT_DIRTY))
             t.dirty_wires.push_back(wire);
-        v.dirty = true;
-        v.visited = true;
-        v.pip = pip;
-        v.score = score;
+        visit_flags[wire] = VISIT_DIRTY | VISIT_VISITED;
+        visit_pip[wire] = pip;
+        visit_score[wire] = score;
     }
-    bool was_visited(int wire) { return flat_wires.at(wire).visit.visited; }
+    bool was_visited(int wire)
+    {
+        LU_TRACK(&visit_flags[wire], 1);
+        return visit_flags[wire] & VISIT_VISITED;
+    }
 
 #ifdef ARCH_XILINX
     // Special-case constant ground/vcc routing for Xilinx devices
@@ -526,7 +695,7 @@ struct Router2
                 std::queue<int> new_queue;
                 t.backwards_queue.swap(new_queue);
             }
-            t.backwards_queue.push(wire_to_idx.at(dst_wire));
+            t.backwards_queue.push(wire_index(dst_wire));
             reset_wires(t);
             while (!t.backwards_queue.empty() && backwards_iter < backwards_limit) {
                 int cursor = t.backwards_queue.front();
@@ -546,7 +715,7 @@ struct Router2
                         PipId p = flat_wires.at(cursor2).bound_nets.at(net->udata).second;
                         if (p == PipId())
                             break;
-                        cursor2 = wire_to_idx.at(ctx->getPipSrcWire(p));
+                        cursor2 = wire_index(ctx->getPipSrcWire(p));
                     }
                     if (!bwd_merge_fail && cursor2 == src_wire_idx) {
                         // Found a path to merge to existing routing; backwards
@@ -555,7 +724,7 @@ struct Router2
                             PipId p = flat_wires.at(cursor2).bound_nets.at(net->udata).second;
                             if (p == PipId())
                                 break;
-                            cursor2 = wire_to_idx.at(ctx->getPipSrcWire(p));
+                            cursor2 = wire_index(ctx->getPipSrcWire(p));
                             set_visited(t, cursor2, p, WireScore());
                         }
                         break;
@@ -582,7 +751,7 @@ struct Router2
                                 continue;
                             if (is_wire_undriveable(src, net))
                                 continue;
-                            cursor2 = wire_to_idx.at(src);
+                            cursor2 = wire_index(src);
                             set_visited(t, cursor2, p, WireScore());
                             found = true;
                             break;
@@ -608,14 +777,16 @@ struct Router2
                         continue;
                     if (cpip != PipId() && cpip != uh)
                         continue; // don't allow multiple pips driving a wire with a net
-                    int next = wire_to_idx.at(ctx->getPipSrcWire(uh));
+                    int next = wire_index(ctx->getPipSrcWire(uh));
                     if (was_visited(next))
                         continue; // skip wires that have already been visited
+                    auto &np = probes[next];
+                    LU_TRACK(&np, sizeof(WireProbe));
+                    if (np.unavailable)
+                        continue;
+                    if (np.reserved_net != -1 && np.reserved_net != net->udata)
+                        continue;
                     auto &wd = flat_wires[next];
-                    if (wd.unavailable)
-                        continue;
-                    if (wd.reserved_net != -1 && wd.reserved_net != net->udata)
-                        continue;
                     if (int(wd.bound_nets.size()) > (allowed_cong + 1) ||
                         (allowed_cong == 0 && wd.bound_nets.size() == 1 && !wd.bound_nets.count(net->udata)))
                         continue; // never allow congestion in backwards routing
@@ -625,15 +796,15 @@ struct Router2
                 if (did_something)
                     ++backwards_iter;
             }
-            int dst_wire_idx = wire_to_idx.at(dst_wire);
+            int dst_wire_idx = wire_index(dst_wire);
             if (was_visited(src_wire_idx)) {
                 ROUTE_LOG_DBG("   Routed (backwards): ");
                 int cursor_fwd = src_wire_idx;
                 bind_pip_internal(net, i, src_wire_idx, PipId());
                 while (was_visited(cursor_fwd)) {
-                    auto &v = flat_wires.at(cursor_fwd).visit;
-                    cursor_fwd = wire_to_idx.at(ctx->getPipDstWire(v.pip));
-                    bind_pip_internal(net, i, cursor_fwd, v.pip);
+                    PipId vpip = visit_pip.at(cursor_fwd);
+                    cursor_fwd = wire_index(ctx->getPipDstWire(vpip));
+                    bind_pip_internal(net, i, cursor_fwd, vpip);
                     if (ctx->debug) {
                         auto &wd = flat_wires.at(cursor_fwd);
                         ROUTE_LOG_DBG("      wire: %s (curr %d hist %f)\n", ctx->nameOfWire(wd.w),
@@ -667,8 +838,8 @@ struct Router2
         if (dst_wire == WireId())
             ARC_LOG_ERR("No wire found for port %s on destination cell %s.\n", ctx->nameOf(usr.port),
                         ctx->nameOf(usr.cell));
-        int src_wire_idx = wire_to_idx.at(src_wire);
-        int dst_wire_idx = wire_to_idx.at(dst_wire);
+        int src_wire_idx = wire_index(src_wire);
+        int dst_wire_idx = wire_index(dst_wire);
         // Check if arc was already done _in this iteration_
         if (t.processed_sinks.count(dst_wire))
             return ARC_SUCCESS;
@@ -698,7 +869,7 @@ struct Router2
         int backwards_limit = ctx->getBelGlobalBuf(net->driver.cell->bel)
                                       ? cfg.global_backwards_max_iter
                                       : (net->users.size() > 40 ? 20 * cfg.backwards_max_iter : cfg.backwards_max_iter);
-        t.backwards_queue.push(wire_to_idx.at(dst_wire));
+        t.backwards_queue.push(wire_index(dst_wire));
         while (!t.backwards_queue.empty() && backwards_iter < backwards_limit) {
             int cursor = t.backwards_queue.front();
             t.backwards_queue.pop();
@@ -713,7 +884,7 @@ struct Router2
                     PipId p = flat_wires.at(cursor2).bound_nets.at(net->udata).second;
                     if (p == PipId())
                         break;
-                    cursor2 = wire_to_idx.at(ctx->getPipSrcWire(p));
+                    cursor2 = wire_index(ctx->getPipSrcWire(p));
                 }
                 if (!bwd_merge_fail && cursor2 == src_wire_idx) {
                     // Found a path to merge to existing routing; backwards
@@ -722,7 +893,7 @@ struct Router2
                         PipId p = flat_wires.at(cursor2).bound_nets.at(net->udata).second;
                         if (p == PipId())
                             break;
-                        cursor2 = wire_to_idx.at(ctx->getPipSrcWire(p));
+                        cursor2 = wire_index(ctx->getPipSrcWire(p));
                         set_visited(t, cursor2, p, WireScore());
                     }
                     break;
@@ -736,17 +907,19 @@ struct Router2
                     continue;
                 if (cpip != PipId() && cpip != uh)
                     continue; // don't allow multiple pips driving a wire with a net
-                int next = wire_to_idx.at(ctx->getPipSrcWire(uh));
+                int next = wire_index(ctx->getPipSrcWire(uh));
                 if (was_visited(next))
                     continue; // skip wires that have already been visited
+                auto &np = probes[next];
+                LU_TRACK(&np, sizeof(WireProbe));
+                if (np.unavailable)
+                    continue;
+                if (np.reserved_net != -1 && np.reserved_net != net->udata)
+                    continue;
                 auto &wd = flat_wires[next];
-                if (wd.unavailable)
-                    continue;
-                if (wd.reserved_net != -1 && wd.reserved_net != net->udata)
-                    continue;
                 if (wd.bound_nets.size() > 1 || (wd.bound_nets.size() == 1 && !wd.bound_nets.count(net->udata)))
                     continue; // never allow congestion in backwards routing
-                if (!thread_test_wire(t, wd))
+                if (!thread_test_wire(t, next))
                     continue; // thread safety issue
                 t.backwards_queue.push(next);
                 set_visited(t, next, uh, WireScore());
@@ -760,9 +933,9 @@ struct Router2
             int cursor_fwd = src_wire_idx;
             bind_pip_internal(net, i, src_wire_idx, PipId());
             while (was_visited(cursor_fwd)) {
-                auto &v = flat_wires.at(cursor_fwd).visit;
-                cursor_fwd = wire_to_idx.at(ctx->getPipDstWire(v.pip));
-                bind_pip_internal(net, i, cursor_fwd, v.pip);
+                PipId vpip = visit_pip.at(cursor_fwd);
+                cursor_fwd = wire_index(ctx->getPipDstWire(vpip));
+                bind_pip_internal(net, i, cursor_fwd, vpip);
                 if (ctx->debug) {
                     auto &wd = flat_wires.at(cursor_fwd);
                     ROUTE_LOG_DBG("      wire: %s (curr %d hist %f)\n", ctx->nameOfWire(wd.w),
@@ -807,6 +980,7 @@ struct Router2
         while (!t.queue.empty() && (must_drain_queue || iter < toexplore)) {
             auto curr = t.queue.top();
             auto &d = flat_wires.at(curr.wire);
+            LU_TRACK(&d.w, sizeof(d.w));
             t.queue.pop();
             ++iter;
 #if 0
@@ -830,29 +1004,32 @@ struct Router2
 #endif
                 // Evaluate score of next wire
                 WireId next = ctx->getPipDstWire(dh);
-                int next_idx = wire_to_idx.at(next);
+                int next_idx = wire_index(next);
                 if (was_visited(next_idx))
                     continue;
 #if 1
                 if (debug_arc)
                     ROUTE_LOG_DBG("   src wire %s\n", ctx->nameOfWire(next));
 #endif
+                auto &np = probes[next_idx];
+                LU_TRACK(&np, sizeof(WireProbe));
+                if (np.unavailable)
+                    continue;
+                if (np.reserved_net != -1 && np.reserved_net != net->udata)
+                    continue;
+                if (np.x < t.bb.x0 || np.x > t.bb.x1 || np.y < t.bb.y0 || np.y > t.bb.y1)
+                    continue; // thread safety issue (bb test inlined on the same probe fetch)
                 auto &nwd = flat_wires.at(next_idx);
-                if (nwd.unavailable)
-                    continue;
-                if (nwd.reserved_net != -1 && nwd.reserved_net != net->udata)
-                    continue;
                 if (nwd.bound_nets.count(net->udata) && nwd.bound_nets.at(net->udata).second != dh)
                     continue;
-                if (!thread_test_wire(t, nwd))
-                    continue; // thread safety issue
                 WireScore next_score;
                 next_score.cost = curr.score.cost + score_wire_for_arc(net, i, next, dh);
                 next_score.delay =
                         curr.score.delay + ctx->getPipDelay(dh).maxDelay() + ctx->getWireDelay(next).maxDelay();
                 next_score.togo_cost = cfg.estimate_weight * get_togo_cost(net, i, next_idx, dst_wire);
-                const auto &v = nwd.visit;
-                if (!v.visited || (v.score.total() > next_score.total())) {
+                LU_TRACK(&visit_flags[next_idx], 1);
+                LU_TRACK(&visit_score[next_idx], sizeof(WireScore));
+                if (!(visit_flags[next_idx] & VISIT_VISITED) || (visit_score[next_idx].total() > next_score.total())) {
                     ++explored;
 #if 0
                     ROUTE_LOG_DBG("exploring wire %s cost %f togo %f\n", ctx->nameOfWire(next), next_score.cost,
@@ -872,21 +1049,21 @@ struct Router2
             ROUTE_LOG_DBG("   Routed (explored %d wires): ", explored);
             int cursor_bwd = dst_wire_idx;
             while (was_visited(cursor_bwd)) {
-                auto &v = flat_wires.at(cursor_bwd).visit;
-                bind_pip_internal(net, i, cursor_bwd, v.pip);
+                PipId vpip = visit_pip.at(cursor_bwd);
+                bind_pip_internal(net, i, cursor_bwd, vpip);
                 if (ctx->debug) {
                     auto &wd = flat_wires.at(cursor_bwd);
                     ROUTE_LOG_DBG("      wire: %s (curr %d hist %f share %d)\n", ctx->nameOfWire(wd.w),
                                   int(wd.bound_nets.size()) - 1, wd.hist_cong_cost,
                                   wd.bound_nets.count(net->udata) ? wd.bound_nets.at(net->udata).first : 0);
                 }
-                if (v.pip == PipId()) {
+                if (vpip == PipId()) {
                     NPNR_ASSERT(cursor_bwd == src_wire_idx);
                     break;
                 }
-                ROUTE_LOG_DBG("         pip: %s (%d, %d)\n", ctx->nameOfPip(v.pip), ctx->getPipLocation(v.pip).x,
-                              ctx->getPipLocation(v.pip).y);
-                cursor_bwd = wire_to_idx.at(ctx->getPipSrcWire(v.pip));
+                ROUTE_LOG_DBG("         pip: %s (%d, %d)\n", ctx->nameOfPip(vpip), ctx->getPipLocation(vpip).x,
+                              ctx->getPipLocation(vpip).y);
+                cursor_bwd = wire_index(ctx->getPipSrcWire(vpip));
             }
             t.processed_sinks.insert(dst_wire);
             ad.routed = true;
@@ -1390,6 +1567,9 @@ struct Router2
             }
             for (auto cn : failed_nets)
                 route_queue.push_back(cn);
+#ifdef ROUTER2_LINE_UTIL
+            line_util.report(iter);
+#endif
             log_info("    iter=%d wires=%d overused=%d overuse=%d archfail=%s\n", iter, total_wire_use, overused_wires,
                      total_overuse, overused_wires > 0 ? "NA" : std::to_string(arch_fail).c_str());
             ++iter;
