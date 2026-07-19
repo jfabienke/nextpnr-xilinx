@@ -848,7 +848,8 @@ static void write_timing_json(Context *ctx, const std::string &filename,
         bool passed = target < clock_fmax[clock.first];
         std::string sedge = clock.second.first.start.edge == FALLING_EDGE ? "negedge" : "posedge";
         std::string eedge = clock.second.first.end.edge == FALLING_EDGE ? "negedge" : "posedge";
-        out << (first_clock ? "" : ",\n") << "    {\n      \"class\": \"estimate\",\n      \"name\": \""
+        out << (first_clock ? "" : ",\n") << "    {\n      \"class\": \"estimate\",\n"
+            << "      \"path_kind\": \"intra_clock\",\n      \"name\": \""
             << esc(clock.first.str(ctx)) << "\",\n      \"fmax_mhz\": " << fmt2(clock_fmax[clock.first])
             << ",\n      \"target_mhz\": " << fmt2(target) << ",\n      \"passed\": " << (passed ? "true" : "false")
             << ",\n      \"start_edge\": \"" << sedge << "\", \"end_edge\": \"" << eedge
@@ -861,7 +862,11 @@ static void write_timing_json(Context *ctx, const std::string &filename,
     bool first_x = true;
     for (auto &xclock : xclock_paths) {
         auto &path = crit_paths.at(xclock);
-        out << (first_x ? "" : ",\n") << "    {\n      \"class\": \"estimate\",\n      \"from\": \""
+        // path_kind marks this a cross-domain path even if a record is read in isolation — its
+        // logic/routing split must not be misread as an ordinary same-domain setup path (it may be a
+        // CDC path constrained differently, or a false path); from/to name the domains it crosses.
+        out << (first_x ? "" : ",\n") << "    {\n      \"class\": \"estimate\",\n"
+            << "      \"path_kind\": \"cross_domain\",\n      \"from\": \""
             << esc(event_str(xclock.start)) << "\", \"to\": \"" << esc(event_str(xclock.end))
             << "\",\n      \"max_delay_ns\": " << ctx->getDelayNS(path.path_delay) << ",\n";
         emit_segments(xclock, path.ports); // segments + logic_ns/routing_ns: the split is on every path record
