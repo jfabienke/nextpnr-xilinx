@@ -157,6 +157,8 @@ po::options_description CommandHandler::getGeneralOptions()
     general.add_options()("no-tmdriv", "disable timing-driven placement");
     general.add_options()("sdf", po::value<std::string>(), "SDF delay back-annotation file to write");
     general.add_options()("sdf-cvc", "enable tweaks for SDF file compatibility with the CVC simulator");
+    general.add_options()("timing-json", po::value<std::string>(),
+                          "write machine-readable timing analysis (estimate class) to a JSON file");
 
     return general;
 }
@@ -209,6 +211,10 @@ void CommandHandler::setupContext(Context *ctx)
 
     if (vm.count("timing-allow-fail")) {
         ctx->settings[ctx->id("timing/allowFail")] = true;
+    }
+
+    if (vm.count("timing-json")) {
+        ctx->settings[ctx->id("timing/jsonExport")] = vm["timing-json"].as<std::string>();
     }
 
     if (vm.count("placer")) {

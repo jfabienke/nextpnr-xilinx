@@ -21,8 +21,11 @@
 #include "timing.h"
 #include <algorithm>
 #include <boost/range/adaptor/reversed.hpp>
+#include <cstdio>
 #include <deque>
+#include <fstream>
 #include <map>
+#include <sstream>
 #include <unordered_map>
 #include <utility>
 #include "log.h"
@@ -717,6 +720,169 @@ void assign_budget(Context *ctx, bool quiet)
         log_info("Checksum: 0x%08x\n", ctx->checksum());
 }
 
+// --timing-json (A3 timing-as-data contract): machine-readable export of the SAME analysis the log
+// prints. Reuses the already-computed clock_reports/clock_fmax so per-domain Fmax matches the log
+// bit-for-bit. Every record carries "class":"estimate" and the document a "delay_model" provenance
+// block (cell delays are DB-real; pip delays are heuristic; wire delays are stubbed to zero) — so a
+// record is structurally impossible to mistake for a Vivado Signoff fact.
+static void write_timing_json(Context *ctx, const std::string &filename,
+                              std::map<IdString, std::pair<ClockPair, CriticalPath>> &clock_reports,
+                              std::map<IdString, double> &clock_fmax, std::vector<ClockPair> &xclock_paths,
+                              CriticalPathMap &crit_paths)
+{
+    std::ofstream out(filename);
+    if (!out) {
+        log_warning("--timing-json: could not open '%s' for writing\n", filename.c_str());
+        return;
+    }
+    auto esc = [](const std::string &s) {
+        std::string o;
+        o.reserve(s.size() + 2);
+        for (char c : s) {
+            switch (c) {
+            case '"': o += "\\\""; break;
+            case '\\': o += "\\\\"; break;
+            case '\n': o += "\\n"; break;
+            case '\r': o += "\\r"; break;
+            case '\t': o += "\\t"; break;
+            default:
+                if (static_cast<unsigned char>(c) < 0x20) {
+                    char b[8];
+                    std::snprintf(b, sizeof(b), "\\u%04x", static_cast<unsigned char>(c));
+                    o += b;
+                } else
+                    o += c;
+            }
+        }
+        return o;
+    };
+    auto fmt2 = [](double v) {
+        char b[32];
+        std::snprintf(b, sizeof(b), "%.2f", v);
+        return std::string(b);
+    };
+    auto event_str = [ctx](const ClockEvent &e) {
+        if (e.clock == ctx->id("$async$"))
+            return std::string("<async>");
+        return (e.edge == FALLING_EDGE ? std::string("negedge ") : std::string("posedge ")) + e.clock.str(ctx);
+    };
+    // segment walk mirroring print_path_report's delay computation exactly (cell + net per hop, setup)
+    auto emit_segments = [&](ClockPair &clocks, PortRefVector &crit_path) {
+        delay_t total = 0, logic_total = 0, route_total = 0;
+        auto &front = crit_path.front();
+        auto &front_port = front->cell->ports.at(front->port);
+        auto &front_driver = front_port.net->driver;
+        int port_clocks;
+        auto portClass = ctx->getPortTimingClass(front_driver.cell, front_driver.port, port_clocks);
+        IdString last_port = front_driver.port;
+        int clock_start = -1;
+        if (portClass == TMG_REGISTER_OUTPUT) {
+            for (int i = 0; i < port_clocks; i++) {
+                TimingClockingInfo clockInfo = ctx->getPortClockingInfo(front_driver.cell, front_driver.port, i);
+                const NetInfo *clknet = get_net_or_empty(front_driver.cell, clockInfo.clock_port);
+                if (clknet != nullptr && clknet->name == clocks.start.clock && clockInfo.edge == clocks.start.edge) {
+                    last_port = clockInfo.clock_port;
+                    clock_start = i;
+                    break;
+                }
+            }
+        }
+        out << "      \"segments\": [\n";
+        bool first = true;
+        for (auto sink : crit_path) {
+            auto sink_cell = sink->cell;
+            auto net = sink_cell->ports.at(sink->port).net;
+            auto &driver = net->driver;
+            auto driver_cell = driver.cell;
+            DelayInfo comb_delay;
+            if (clock_start != -1) {
+                comb_delay = ctx->getPortClockingInfo(driver_cell, driver.port, clock_start).clockToQ;
+                clock_start = -1;
+            } else if (last_port == driver.port) {
+                comb_delay = ctx->getDelayFromNS(0);
+            } else {
+                ctx->getCellDelay(driver_cell, last_port, driver.port, comb_delay);
+            }
+            total += comb_delay.maxDelay();
+            logic_total += comb_delay.maxDelay();
+            out << (first ? "" : ",\n") << "        {\"type\": \"logic\", \"delay_ns\": "
+                << ctx->getDelayNS(comb_delay.maxDelay()) << ", \"total_ns\": " << ctx->getDelayNS(total)
+                << ", \"from\": \"" << esc(std::string(driver_cell->name.c_str(ctx)) + "." + driver.port.c_str(ctx))
+                << "\"}";
+            first = false;
+            auto net_delay = ctx->getNetinfoRouteDelay(net, *sink);
+            total += net_delay;
+            route_total += net_delay;
+            auto dl = ctx->getBelLocation(driver_cell->bel);
+            auto sl = ctx->getBelLocation(sink_cell->bel);
+            out << ",\n        {\"type\": \"route\", \"delay_ns\": " << ctx->getDelayNS(net_delay)
+                << ", \"total_ns\": " << ctx->getDelayNS(total) << ", \"net\": \"" << esc(net->name.c_str(ctx))
+                << "\", \"from_loc\": [" << dl.x << ", " << dl.y << "], \"to_loc\": [" << sl.x << ", " << sl.y
+                << "], \"sink\": \"" << esc(std::string(sink_cell->name.c_str(ctx)) + "." + sink->port.c_str(ctx))
+                << "\"}";
+            last_port = sink->port;
+        }
+        int clockCount = 0;
+        auto sinkClass = ctx->getPortTimingClass(crit_path.back()->cell, crit_path.back()->port, clockCount);
+        if (sinkClass == TMG_REGISTER_INPUT && clockCount > 0) {
+            delay_t setup = ctx->getPortClockingInfo(crit_path.back()->cell, crit_path.back()->port, 0).setup.maxDelay();
+            total += setup;
+            logic_total += setup;
+            out << ",\n        {\"type\": \"setup\", \"delay_ns\": " << ctx->getDelayNS(setup) << ", \"total_ns\": "
+                << ctx->getDelayNS(total) << ", \"at\": \""
+                << esc(std::string(crit_path.back()->cell->name.c_str(ctx)) + "." + crit_path.back()->port.c_str(ctx))
+                << "\"}";
+        }
+        out << "\n      ],\n      \"logic_ns\": " << ctx->getDelayNS(logic_total)
+            << ", \"routing_ns\": " << ctx->getDelayNS(route_total);
+    };
+
+    out << "{\n  \"tool\": \"nextpnr-xilinx\",\n  \"class\": \"estimate\",\n"
+        << "  \"delay_model\": {\"cell\": \"db\", \"pip\": \"heuristic\", \"wire\": \"stub\"},\n";
+    out << "  \"clocks\": [\n";
+    bool first_clock = true;
+    for (auto &clock : clock_reports) {
+        float target = ctx->setting<float>("target_freq") / 1e6;
+        if (ctx->nets.at(clock.first)->clkconstr)
+            target = 1000 / ctx->getDelayNS(ctx->nets.at(clock.first)->clkconstr->period.minDelay());
+        bool passed = target < clock_fmax[clock.first];
+        std::string sedge = clock.second.first.start.edge == FALLING_EDGE ? "negedge" : "posedge";
+        std::string eedge = clock.second.first.end.edge == FALLING_EDGE ? "negedge" : "posedge";
+        out << (first_clock ? "" : ",\n") << "    {\n      \"class\": \"estimate\",\n      \"name\": \""
+            << esc(clock.first.str(ctx)) << "\",\n      \"fmax_mhz\": " << fmt2(clock_fmax[clock.first])
+            << ",\n      \"target_mhz\": " << fmt2(target) << ",\n      \"passed\": " << (passed ? "true" : "false")
+            << ",\n      \"start_edge\": \"" << sedge << "\", \"end_edge\": \"" << eedge
+            << "\",\n      \"path_delay_ns\": " << ctx->getDelayNS(clock.second.second.path_delay) << ",\n";
+        emit_segments(clock.second.first, clock.second.second.ports);
+        out << "\n    }";
+        first_clock = false;
+    }
+    out << "\n  ],\n  \"cross_domain\": [\n";
+    bool first_x = true;
+    for (auto &xclock : xclock_paths) {
+        auto &path = crit_paths.at(xclock);
+        out << (first_x ? "" : ",\n") << "    {\"class\": \"estimate\", \"from\": \"" << esc(event_str(xclock.start))
+            << "\", \"to\": \"" << esc(event_str(xclock.end)) << "\", \"max_delay_ns\": "
+            << ctx->getDelayNS(path.path_delay) << "}";
+        first_x = false;
+    }
+    out << "\n  ],\n  \"net_criticality\": [\n";
+    NetCriticalityMap net_crit;
+    get_criticalities(ctx, &net_crit);
+    bool first_n = true;
+    for (auto &nc : net_crit) {
+        float maxcrit = 0;
+        for (float c : nc.second.criticality)
+            maxcrit = std::max(maxcrit, c);
+        out << (first_n ? "" : ",\n") << "    {\"class\": \"estimate\", \"net\": \"" << esc(nc.first.str(ctx))
+            << "\", \"worst_slack_ns\": " << ctx->getDelayNS(nc.second.cd_worst_slack) << ", \"max_criticality\": "
+            << maxcrit << ", \"max_path_length\": " << nc.second.max_path_length << "}";
+        first_n = false;
+    }
+    out << "\n  ]\n}\n";
+    log_info("Wrote timing JSON (estimate class) to '%s'\n", filename.c_str());
+}
+
 void timing_analysis(Context *ctx, bool print_histogram, bool print_fmax, bool print_path, bool warn_on_failure)
 {
     auto format_event = [ctx](const ClockEvent &e, int field_width = 0) {
@@ -952,6 +1118,14 @@ void timing_analysis(Context *ctx, bool print_histogram, bool print_fmax, bool p
             log_info("Max delay %s -> %s: %0.02f ns\n", ev_a.c_str(), ev_b.c_str(), ctx->getDelayNS(path.path_delay));
         }
         log_break();
+    }
+
+    // --timing-json export: gate on print_path (the final routed report at router1.cc sets it; the
+    // placer's interim print_fmax passes do not), so exactly one clean file is written — from the
+    // routed pass — and the extra get_criticalities walk isn't paid on interim placer reports.
+    if (print_path && ctx->settings.count(ctx->id("timing/jsonExport"))) {
+        write_timing_json(ctx, ctx->settings.at(ctx->id("timing/jsonExport")).as_string(), clock_reports, clock_fmax,
+                          xclock_paths, crit_paths);
     }
 
     if (print_histogram && slack_histogram.size() > 0) {
