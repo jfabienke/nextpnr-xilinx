@@ -861,9 +861,11 @@ static void write_timing_json(Context *ctx, const std::string &filename,
     bool first_x = true;
     for (auto &xclock : xclock_paths) {
         auto &path = crit_paths.at(xclock);
-        out << (first_x ? "" : ",\n") << "    {\"class\": \"estimate\", \"from\": \"" << esc(event_str(xclock.start))
-            << "\", \"to\": \"" << esc(event_str(xclock.end)) << "\", \"max_delay_ns\": "
-            << ctx->getDelayNS(path.path_delay) << "}";
+        out << (first_x ? "" : ",\n") << "    {\n      \"class\": \"estimate\",\n      \"from\": \""
+            << esc(event_str(xclock.start)) << "\", \"to\": \"" << esc(event_str(xclock.end))
+            << "\",\n      \"max_delay_ns\": " << ctx->getDelayNS(path.path_delay) << ",\n";
+        emit_segments(xclock, path.ports); // segments + logic_ns/routing_ns: the split is on every path record
+        out << "\n    }";
         first_x = false;
     }
     out << "\n  ],\n  \"net_criticality\": [\n";
